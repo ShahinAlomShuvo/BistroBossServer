@@ -4,6 +4,7 @@ const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const cookieParser = require("cookie-parser");
 require("dotenv").config();
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const port = process.env.PORT || 5000;
 
@@ -53,6 +54,7 @@ async function run() {
     const reviewCollection = client.db("bistroBossDB").collection("review");
     const cartCollection = client.db("bistroBossDB").collection("cart");
     const userCollection = client.db("bistroBossDB").collection("users");
+    const paymentCollection = client.db("bistroBossDB").collection("payments");
 
     // admin verify middleware
     const verifyAdmin = async (req, res, next) => {
@@ -63,7 +65,7 @@ async function run() {
       if (!isAdmin) {
         return res.status(403).send({ message: "Forbidden Access" });
       }
-      console.log(user);
+      // console.log(user);
       next();
     };
 
@@ -105,6 +107,45 @@ async function run() {
     // menusCollection api
     app.get("/menus", async (req, res) => {
       const result = await menusCollection.find().toArray();
+      res.send(result);
+    });
+
+    app.get("/menus/:id", async (req, res) => {
+      const id = req.params.id;
+      const query = { _id: new ObjectId(id) };
+      const result = await menusCollection.findOne(query);
+      res.send(result);
+    });
+
+    app.post("/menus", verifyToken, verifyAdmin, async (req, res) => {
+      const menu = req.body;
+      const result = await menusCollection.insertOne(menu);
+      res.send(result);
+    });
+
+    app.patch("/menus/:id", verifyToken, verifyAdmin, async (req, res) => {
+      const menuItems = req.body;
+
+      const id = req.params.id;
+      const filter = { _id: new ObjectId(id) };
+      const updateDoc = {
+        $set: {
+          name: menuItems.name,
+          category: menuItems.category,
+          price: menuItems.price,
+          recipe: menuItems.recipe,
+          image: menuItems.image,
+        },
+      };
+      const result = await menusCollection.updateOne(filter, updateDoc);
+      res.send(result);
+    });
+
+    app.delete("/menus/:id", verifyToken, verifyAdmin, async (req, res) => {
+      const id = req.params.id;
+      console.log(id);
+      const query = { _id: new ObjectId(id) };
+      const result = await menusCollection.deleteOne(query);
       res.send(result);
     });
 
@@ -192,6 +233,126 @@ async function run() {
       const id = req.params.id;
       const query = { _id: new ObjectId(id) };
       const result = await userCollection.deleteOne(query);
+      res.send(result);
+    });
+
+    // for PaymentIntent
+
+    app.post("/create-payment-intent", async (req, res) => {
+      const { price } = req.body;
+      const amount = parseInt(price * 100);
+
+      // Create a PaymentIntent with the order amount and currency
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: amount,
+        currency: "usd",
+        payment_method_types: ["card"],
+      });
+
+      res.send({
+        clientSecret: paymentIntent.client_secret,
+      });
+    });
+
+    // payment api
+    app.get("/payments/:email", verifyToken, async (req, res) => {
+      const email = req.params.email;
+      const query = { email: email };
+
+      if (email !== req.user.email) {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+
+      const result = await paymentCollection.find(query).toArray();
+      res.send(result);
+    });
+
+    app.post("/payments", async (req, res) => {
+      const payment = req.body;
+      const paymentResult = await paymentCollection.insertOne(payment);
+
+      // delete from cart collection
+      const query = {
+        _id: {
+          $in: payment.cartIds.map((id) => new ObjectId(id)),
+        },
+      };
+
+      const deleteResult = await cartCollection.deleteMany(query);
+
+      res.send({ paymentResult, deleteResult });
+    });
+
+    // admin stats api
+    app.get("/admin-stats", verifyToken, verifyAdmin, async (req, res) => {
+      // to get how many documents/users are here
+      const users = await userCollection.estimatedDocumentCount();
+      const menuItems = await menusCollection.estimatedDocumentCount();
+      const orders = await paymentCollection.estimatedDocumentCount();
+
+      // this is not the best way for calculate sum
+      // const payments = await paymentCollection.find().toArray();
+      // const revenue = payments.reduce(
+      //   (total, payment) => total + payment.price,
+      //   0
+      // );
+
+      // This is a better way
+      const result = await paymentCollection
+        .aggregate([
+          {
+            $group: {
+              _id: null,
+              totalRevenue: {
+                $sum: "$price",
+              },
+            },
+          },
+        ])
+        .toArray();
+
+      const revenue = result.length > 0 ? result[0].totalRevenue : 0;
+
+      res.send({
+        users,
+        menuItems,
+        orders,
+        revenue,
+      });
+    });
+
+    app.get("/orderStats", async (req, res) => {
+      const result = await paymentCollection
+        .aggregate([
+          {
+            $unwind: "$menuItemsIds",
+          },
+          {
+            $addFields: {
+              menuItemsObjectId: { $toObjectId: "$menuItemsIds" }, // Convert menuItemsIds to ObjectId
+            },
+          },
+          {
+            $lookup: {
+              from: "menu",
+              localField: "menuItemsObjectId",
+              foreignField: "_id",
+              as: "menuItems",
+            },
+          },
+          {
+            $unwind: "$menuItems",
+          },
+          {
+            $group: {
+              _id: "$menuItems.category",
+              quantity: { $sum: 1 },
+              revenue: { $sum: "$menuItems.price" },
+            },
+          },
+        ])
+        .toArray();
+
       res.send(result);
     });
 
